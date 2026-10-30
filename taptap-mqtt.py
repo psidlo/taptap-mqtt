@@ -313,6 +313,10 @@ if config["TAPTAP"]["LOG_LEVEL"] and config["TAPTAP"]["LOG_LEVEL"] not in [
     logger.error("Invalid TAPTAP LOG_LEVEL config entry!")
     exit(1)
 
+# FVE optional report-by-report MQTT mode v1
+# Missing in existing config.ini = original timed telemetry mode.
+PUBLISH_EVERY_REPORT = config["TAPTAP"].getboolean("PUBLISH_EVERY_REPORT", fallback=False)
+
 logger.setLevel(config["TAPTAP"]["LOG_LEVEL"].upper())
 if config["TAPTAP"]["LOG_LEVEL"] == "debug":
     # Reconfigure logging with microseconds for debug level
@@ -370,6 +374,9 @@ state = {}
 
 # Power Reports cache
 cache = {}
+
+# Accumulate incomplete records from the nonblocking taptap stdout pipe.
+_pending_observe_record = bytearray()
 
 # Init discovery struct
 discovery = {}
@@ -480,9 +487,21 @@ def taptap_tele() -> None:
         line = taptap.stdout.readline()
         if not line:
             break
-        elif time.time() - now > int(config["TAPTAP"]["UPDATE"]) - 1:
+        if PUBLISH_EVERY_REPORT:
+            # stdout is nonblocking; parse only complete JSON records.
+            _pending_observe_record.extend(line)
+            if b"\n" not in _pending_observe_record:
+                if len(_pending_observe_record) > 1024 * 1024:
+                    logger.warning("Oversized unfinished TapTap record discarded")
+                    _pending_observe_record.clear()
+                continue
+            line = bytes(_pending_observe_record)
+            _pending_observe_record.clear()
+        # UPDATE does not gate delivery in the per-report mode.
+        if time.time() - now > (3 if PUBLISH_EVERY_REPORT else int(config["TAPTAP"]["UPDATE"]) - 1):
             logger.warning(f"Slow run detected reading taptap messages!")
-            taptap.stdout.truncate()
+            if not PUBLISH_EVERY_REPORT:
+                taptap.stdout.truncate()
             break
 
         try:
@@ -512,6 +531,9 @@ def taptap_tele() -> None:
             if taptap_power_event(data, now):
                 # Power Report processed
                 cache[nodes_ids[str(data["node_id"])]][data["tmstp"]] = data
+                if PUBLISH_EVERY_REPORT:
+                    # Publish one state message for each accepted power_report.
+                    taptap_flush_cache(time.time())
                 logger.debug("Successfully processed power event")
                 logger.debug(data)
         else:
@@ -519,60 +541,97 @@ def taptap_tele() -> None:
             logger.debug(data)
             continue
 
-    if last_tele + int(config["TAPTAP"]["UPDATE"]) < now:
-        dt = {
-            "last": datetime.fromtimestamp(last_tele, tz.tzlocal()),
-            "now": datetime.fromtimestamp(now, tz.tzlocal()),
-        }
+    if PUBLISH_EVERY_REPORT:
+        # Maintain availability updates independently of UPDATE timing.
+        if last_tele + 10 < time.time():
+            taptap_flush_cache(time.time())
+    elif last_tele + int(config["TAPTAP"]["UPDATE"]) < now:
+        taptap_flush_cache(now)
 
-        # Reset statistic tele
-        reset_stats_tele(dt)
 
-        for node_name in nodes:
-            if nodes[node_name]["node_id"] is None:
-                # Not yet received any message from this node
-                logger.debug(f"Node {node_name} not yet seen on the bus")
-                reset_node_tele(node_name, dt)
-                continue
-            elif nodes[node_name]["node_serial"] is not None:
-                # Set identified state
-                state["nodes"][node_name]["state_identified"] = "online"
-                state["stats"]["overall"]["nodes_identified"]["count"] += 1
-                if strings and nodes[node_name]["string_name"] is not None:
-                    state["stats"][nodes[node_name]["string_name"]]["nodes_identified"][
-                        "count"
-                    ] += 1
+@log_args
+def taptap_flush_cache(now: float) -> None:
+    """Update the original MQTT state from the available measurements."""
+    global last_tele, state, cache
+    dt = {
+        "last": datetime.fromtimestamp(last_tele, tz.tzlocal()),
+        "now": datetime.fromtimestamp(now, tz.tzlocal()),
+    }
+
+    # Reset statistic tele
+    reset_stats_tele(dt)
+
+    for node_name in nodes:
+        if nodes[node_name]["node_id"] is None:
+            # Not yet received any message from this node
+            logger.debug(f"Node {node_name} not yet seen on the bus")
+            reset_node_tele(node_name, dt)
+            continue
+        elif nodes[node_name]["node_serial"] is not None:
+            # Set identified state
+            state["nodes"][node_name]["state_identified"] = "online"
+            state["stats"]["overall"]["nodes_identified"]["count"] += 1
+            if strings and nodes[node_name]["string_name"] is not None:
+                state["stats"][nodes[node_name]["string_name"]]["nodes_identified"][
+                    "count"
+                ] += 1
+        else:
+            state["nodes"][node_name]["state_identified"] = "offline"
+
+        if node_name in cache and len(cache[node_name]):
+            # Node is online - update sensor values
+            if state["nodes"][node_name]["state_online"] == "offline":
+                logger.info(f"Node {node_name} came online")
             else:
-                state["nodes"][node_name]["state_identified"] = "offline"
+                logger.debug(f"Node {node_name} is online")
 
-            if node_name in cache and len(cache[node_name]):
-                # Node is online - update sensor values
-                if state["nodes"][node_name]["state_online"] == "offline":
-                    logger.info(f"Node {node_name} came online")
-                else:
-                    logger.debug(f"Node {node_name} is online")
+            state["stats"]["overall"]["nodes_online"]["count"] += 1
+            if strings and nodes[node_name]["string_name"] is not None:
+                state["stats"][nodes[node_name]["string_name"]]["nodes_online"][
+                    "count"
+                ] += 1
 
-                state["stats"]["overall"]["nodes_online"]["count"] += 1
-                if strings and nodes[node_name]["string_name"] is not None:
-                    state["stats"][nodes[node_name]["string_name"]]["nodes_online"][
-                        "count"
-                    ] += 1
+            last = max(cache[node_name])
 
-                last = max(cache[node_name])
-
-                # Update node sensors
-                for sensor in sensors:
-                    if not sensors[sensor]["type_node"]:
-                        continue
-                    value = None
-                    type = list(sensors[sensor]["type_node"])[0]
-                    if type == "node":
-                        value = nodes[node_name][sensors[sensor]["type_node"]["node"]]
+            # Update node sensors
+            for sensor in sensors:
+                if not sensors[sensor]["type_node"]:
+                    continue
+                value = None
+                type = list(sensors[sensor]["type_node"])[0]
+                if type == "node":
+                    value = nodes[node_name][sensors[sensor]["type_node"]["node"]]
+                    state["nodes"][node_name][sensor] = value
+                elif type in ["daily", "weekly", "monthly", "yearly"]:
+                    # Calculate integral value for the period
+                    prev_tmstp = state["nodes"][node_name]["tmstp"]
+                    value = 0
+                    for tmstp in sorted(cache[node_name]):
+                        if (
+                            prev_tmstp < tmstp
+                            and prev_tmstp + int(config["TAPTAP"]["TIMEOUT"])
+                            > tmstp
+                        ):
+                            tmstp_diff = tmstp - prev_tmstp
+                            value += (
+                                cache[node_name][tmstp][
+                                    sensors[sensor]["type_node"][type]
+                                ]
+                                * tmstp_diff
+                            )
+                        prev_tmstp = tmstp
+                    if "scale" in sensors[sensor]:
+                        value *= sensors[sensor]["scale"]
+                    if reset_sensor_integral(type, dt):
                         state["nodes"][node_name][sensor] = value
-                    elif type in ["daily", "weekly", "monthly", "yearly"]:
-                        # Calculate integral value for the period
+                    else:
+                        state["nodes"][node_name][sensor] += value
+                elif type == "value":
+                    if sensors[sensor]["unit"]:
+                        # Calculate time-weighted average
                         prev_tmstp = state["nodes"][node_name]["tmstp"]
                         value = 0
+                        total_diff = 0
                         for tmstp in sorted(cache[node_name]):
                             if (
                                 prev_tmstp < tmstp
@@ -586,183 +645,157 @@ def taptap_tele() -> None:
                                     ]
                                     * tmstp_diff
                                 )
+                                total_diff += tmstp_diff
                             prev_tmstp = tmstp
-                        if "scale" in sensors[sensor]:
-                            value *= sensors[sensor]["scale"]
-                        if reset_sensor_integral(type, dt):
-                            state["nodes"][node_name][sensor] = value
+                        if total_diff > 0:
+                            value /= total_diff
                         else:
-                            state["nodes"][node_name][sensor] += value
-                    elif type == "value":
-                        if sensors[sensor]["unit"]:
-                            # Calculate time-weighted average
-                            prev_tmstp = state["nodes"][node_name]["tmstp"]
-                            value = 0
-                            total_diff = 0
-                            for tmstp in sorted(cache[node_name]):
-                                if (
-                                    prev_tmstp < tmstp
-                                    and prev_tmstp + int(config["TAPTAP"]["TIMEOUT"])
-                                    > tmstp
-                                ):
-                                    tmstp_diff = tmstp - prev_tmstp
-                                    value += (
-                                        cache[node_name][tmstp][
-                                            sensors[sensor]["type_node"][type]
-                                        ]
-                                        * tmstp_diff
-                                    )
-                                    total_diff += tmstp_diff
-                                prev_tmstp = tmstp
-                            if total_diff > 0:
-                                value /= total_diff
-                            else:
-                                value = cache[node_name][last][
-                                    sensors[sensor]["type_node"][type]
-                                ]
-                            if "scale" in sensors[sensor]:
-                                value *= sensors[sensor]["scale"]
-                        else:
-                            # Take latest value
                             value = cache[node_name][last][
                                 sensors[sensor]["type_node"][type]
                             ]
-                        state["nodes"][node_name][sensor] = value
-
-                    # update statistic sensors
-                    update_stats_tele(sensor, node_name, value)
-
-                state["nodes"][node_name].update(
-                    {
-                        "state_online": "online",
-                        "state_init": "online",
-                        "tmstp": cache[node_name][last]["tmstp"],
-                        "timestamp": cache[node_name][last]["timestamp"],
-                    }
-                )
-
-                # Reset cache
-                cache[node_name] = {}
-
-            elif (
-                state["nodes"][node_name]["state_online"] == "online"
-                and state["nodes"][node_name]["tmstp"]
-                + int(config["TAPTAP"]["TIMEOUT"])
-                >= now
-            ):
-                # Node is online but no new data were received - keep last valid sensor values
-                logger.info(f"Node {node_name} didn't report new data")
-                state["stats"]["overall"]["nodes_online"]["count"] += 1
-                if strings and nodes[node_name]["string_name"] is not None:
-                    state["stats"][nodes[node_name]["string_name"]]["nodes_online"][
-                        "count"
-                    ] += 1
-
-                for sensor in sensors:
-                    if not sensors[sensor]["type_node"]:
-                        continue
-                    type = list(sensors[sensor]["type_node"])[0]
-                    if type in ["daily", "weekly", "monthly", "yearly"]:
-                        # Don't increment integral sensors without data
-                        value = 0
-                        # Reset integral sensors if needed
-                        if reset_sensor_integral(type, dt):
-                            state["nodes"][node_name][sensor] = 0
+                        if "scale" in sensors[sensor]:
+                            value *= sensors[sensor]["scale"]
                     else:
-                        value = state["nodes"][node_name][sensor]
+                        # Take latest value
+                        value = cache[node_name][last][
+                            sensors[sensor]["type_node"][type]
+                        ]
+                    state["nodes"][node_name][sensor] = value
 
-                    # update statistic sensors
-                    update_stats_tele(sensor, node_name, value)
+                # update statistic sensors
+                update_stats_tele(sensor, node_name, value)
 
-            elif state["nodes"][node_name]["state_online"] == "online":
-                # Node went recently offline - reset sensor values, keep node sensors updated
-                logger.info(f"Node {node_name} went offline")
-                for sensor in sensors:
-                    if not sensors[sensor]["type_node"]:
-                        continue
-                    type = list(sensors[sensor]["type_node"])[0]
-                    reset_node_sensor(
-                        sensor, type, dt, state["nodes"][node_name], nodes[node_name]
-                    )
-
-                state["nodes"][node_name]["state_online"] = "offline"
-
-            else:
-                # Node is offline - reset sensor values, keep node sensors updated
-                logger.debug(f"Node {node_name} is offline")
-                for sensor in sensors:
-                    if not sensors[sensor]["type_node"]:
-                        continue
-                    type = list(sensors[sensor]["type_node"])[0]
-                    reset_node_sensor(
-                        sensor, type, dt, state["nodes"][node_name], nodes[node_name]
-                    )
-
-                state["nodes"][node_name]["state_online"] = "offline"
-
-        for string_name in ["overall"] + list(strings):
-            # Set identified state
-            if state["stats"][string_name]["nodes_identified"]["count"] == 0:
-                logger.debug(f"No nodes were find identified during last cycle")
-                state["stats"][string_name]["state_identified"] = "offline"
-            elif (
-                state["stats"][string_name]["nodes_identified"]["count"]
-                < state["stats"][string_name]["nodes_total"]["count"]
-            ):
-                logger.info(
-                    f"Only '{state['stats'][string_name]['nodes_identified']['count']}' nodes were find identified during last cycle",
-                )
-                state["stats"][string_name]["state_identified"] = "offline"
-            else:
-                logger.debug(
-                    f"All '{state['stats'][string_name]['nodes_identified']['count']}' nodes were find identified during last cycle",
-                )
-                state["stats"][string_name]["state_identified"] = "online"
-
-            # Set device state
-            if state["stats"][string_name]["nodes_online"]["count"] == 0:
-                logger.debug(f"No nodes reported online during last cycle")
-                state["stats"][string_name]["state_online"] = "offline"
-            elif (
-                state["stats"][string_name]["nodes_online"]["count"]
-                < state["stats"][string_name]["nodes_total"]["count"]
-            ):
-                logger.info(
-                    f"Only '{state['stats'][string_name]['nodes_online']['count']}' nodes reported online during last cycle",
-                )
-                state["stats"][string_name]["state_online"] = "online"
-            else:
-                logger.debug(
-                    f"All '{state['stats'][string_name]['nodes_online']['count']}' nodes reported online during last cycle",
-                )
-                state["stats"][string_name]["state_online"] = "online"
-
-        time_up = uptime.uptime()
-        result = "%01d" % int(time_up / 86400)
-        time_up = time_up % 86400
-        result = result + "T" + "%02d" % (int(time_up / 3600))
-        time_up = time_up % 3600
-        state["uptime"] = (
-            result + ":" + "%02d" % (int(time_up / 60)) + ":" + "%02d" % (time_up % 60)
-        )
-        state["time"] = datetime.fromtimestamp(now, tz.tzlocal()).isoformat()
-
-        if client and client.is_connected():
-            # Sent LWT update
-            logger.debug(f"Publish MQTT lwt topic {lwt_topic}")
-            client.publish(
-                lwt_topic, payload="online", qos=int(config["MQTT"]["QOS"]), retain=True
+            state["nodes"][node_name].update(
+                {
+                    "state_online": "online",
+                    "state_init": "online",
+                    "tmstp": cache[node_name][last]["tmstp"],
+                    "timestamp": cache[node_name][last]["timestamp"],
+                }
             )
-            # Sent State update
-            logger.debug(f"Updating MQTT state topic {state_topic}")
-            logger.debug(json.dumps(state))
-            client.publish(
-                state_topic, payload=json.dumps(state), qos=int(config["MQTT"]["QOS"])
-            )
-            last_tele = now
+
+            # Reset cache
+            cache[node_name] = {}
+
+        elif (
+            state["nodes"][node_name]["state_online"] == "online"
+            and state["nodes"][node_name]["tmstp"]
+            + int(config["TAPTAP"]["TIMEOUT"])
+            >= now
+        ):
+            # Node is online but no new data were received - keep last valid sensor values
+            logger.info(f"Node {node_name} didn't report new data")
+            state["stats"]["overall"]["nodes_online"]["count"] += 1
+            if strings and nodes[node_name]["string_name"] is not None:
+                state["stats"][nodes[node_name]["string_name"]]["nodes_online"][
+                    "count"
+                ] += 1
+
+            for sensor in sensors:
+                if not sensors[sensor]["type_node"]:
+                    continue
+                type = list(sensors[sensor]["type_node"])[0]
+                if type in ["daily", "weekly", "monthly", "yearly"]:
+                    # Don't increment integral sensors without data
+                    value = 0
+                    # Reset integral sensors if needed
+                    if reset_sensor_integral(type, dt):
+                        state["nodes"][node_name][sensor] = 0
+                else:
+                    value = state["nodes"][node_name][sensor]
+
+                # update statistic sensors
+                update_stats_tele(sensor, node_name, value)
+
+        elif state["nodes"][node_name]["state_online"] == "online":
+            # Node went recently offline - reset sensor values, keep node sensors updated
+            logger.info(f"Node {node_name} went offline")
+            for sensor in sensors:
+                if not sensors[sensor]["type_node"]:
+                    continue
+                type = list(sensors[sensor]["type_node"])[0]
+                reset_node_sensor(
+                    sensor, type, dt, state["nodes"][node_name], nodes[node_name]
+                )
+
+            state["nodes"][node_name]["state_online"] = "offline"
+
         else:
-            logger.error("MQTT not connected!")
-            raise MqttError("MQTT not connected!")
+            # Node is offline - reset sensor values, keep node sensors updated
+            logger.debug(f"Node {node_name} is offline")
+            for sensor in sensors:
+                if not sensors[sensor]["type_node"]:
+                    continue
+                type = list(sensors[sensor]["type_node"])[0]
+                reset_node_sensor(
+                    sensor, type, dt, state["nodes"][node_name], nodes[node_name]
+                )
+
+            state["nodes"][node_name]["state_online"] = "offline"
+
+    for string_name in ["overall"] + list(strings):
+        # Set identified state
+        if state["stats"][string_name]["nodes_identified"]["count"] == 0:
+            logger.debug(f"No nodes were find identified during last cycle")
+            state["stats"][string_name]["state_identified"] = "offline"
+        elif (
+            state["stats"][string_name]["nodes_identified"]["count"]
+            < state["stats"][string_name]["nodes_total"]["count"]
+        ):
+            logger.info(
+                f"Only '{state['stats'][string_name]['nodes_identified']['count']}' nodes were find identified during last cycle",
+            )
+            state["stats"][string_name]["state_identified"] = "offline"
+        else:
+            logger.debug(
+                f"All '{state['stats'][string_name]['nodes_identified']['count']}' nodes were find identified during last cycle",
+            )
+            state["stats"][string_name]["state_identified"] = "online"
+
+        # Set device state
+        if state["stats"][string_name]["nodes_online"]["count"] == 0:
+            logger.debug(f"No nodes reported online during last cycle")
+            state["stats"][string_name]["state_online"] = "offline"
+        elif (
+            state["stats"][string_name]["nodes_online"]["count"]
+            < state["stats"][string_name]["nodes_total"]["count"]
+        ):
+            logger.info(
+                f"Only '{state['stats'][string_name]['nodes_online']['count']}' nodes reported online during last cycle",
+            )
+            state["stats"][string_name]["state_online"] = "online"
+        else:
+            logger.debug(
+                f"All '{state['stats'][string_name]['nodes_online']['count']}' nodes reported online during last cycle",
+            )
+            state["stats"][string_name]["state_online"] = "online"
+
+    time_up = uptime.uptime()
+    result = "%01d" % int(time_up / 86400)
+    time_up = time_up % 86400
+    result = result + "T" + "%02d" % (int(time_up / 3600))
+    time_up = time_up % 3600
+    state["uptime"] = (
+        result + ":" + "%02d" % (int(time_up / 60)) + ":" + "%02d" % (time_up % 60)
+    )
+    state["time"] = datetime.fromtimestamp(now, tz.tzlocal()).isoformat()
+
+    if client and client.is_connected():
+        # Sent LWT update
+        logger.debug(f"Publish MQTT lwt topic {lwt_topic}")
+        client.publish(
+            lwt_topic, payload="online", qos=int(config["MQTT"]["QOS"]), retain=True
+        )
+        # Sent State update
+        logger.debug(f"Updating MQTT state topic {state_topic}")
+        logger.debug(json.dumps(state))
+        client.publish(
+            state_topic, payload=json.dumps(state), qos=int(config["MQTT"]["QOS"])
+        )
+        last_tele = now
+    else:
+        logger.error("MQTT not connected!")
+        raise MqttError("MQTT not connected!")
 
 
 @log_args
@@ -1004,8 +1037,11 @@ def taptap_power_event(data: dict, now: float) -> bool:
                 logger.debug(data)
                 return False
             try:
-                tmstp = parser.parse(data[name])
-                data["timestamp"] = tmstp.isoformat()
+                original_timestamp = data[name]
+                tmstp = parser.parse(original_timestamp)
+                data["timestamp"] = (
+                    original_timestamp if PUBLISH_EVERY_REPORT else tmstp.isoformat()
+                )
                 data["tmstp"] = tmstp.timestamp()
             except Exception:
                 logger.warning(f"Invalid key: '{name}' value: '{data[name]}'")
