@@ -43,6 +43,9 @@ TOPIC_NAME = tigo1
 # Time after which Tigo module is declared offline if no message is received.
 TIMEOUT = 180
 # How often MQTT state topic shall be updated.
+# Publish each accepted Tigo power_report immediately with original timestamp.
+# Default false; when enabled UPDATE no longer controls MQTT publication.
+PUBLISH_EVERY_REPORT = false
 UPDATE = 15
 # Persistent data file for taptap to store detected modules serial numbers to be used for fast topology data init during restarts.
 STATE_FILE = ./taptap.json
