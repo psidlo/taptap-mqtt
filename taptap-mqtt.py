@@ -530,10 +530,22 @@ def taptap_tele() -> None:
             logger.debug(data)
             if taptap_power_event(data, now):
                 # Power Report processed
-                cache[nodes_ids[str(data["node_id"])]][data["tmstp"]] = data
+                node_name = nodes_ids[str(data["node_id"])]
+                if (
+                    PUBLISH_EVERY_REPORT
+                    and data["tmstp"] <= state["nodes"][node_name]["tmstp"]
+                ):
+                    # Never roll back a node when a report arrives late or twice.
+                    logger.debug(
+                        f"Ignoring duplicate/out-of-order power_report for {node_name}: "
+                        f"{data['timestamp']} <= "
+                        f"{state['nodes'][node_name].get('timestamp')}"
+                    )
+                    continue
+                cache[node_name][data["tmstp"]] = data
                 if PUBLISH_EVERY_REPORT:
-                    # Publish one state message for each accepted power_report.
-                    taptap_flush_cache(time.time())
+                    # Publish one state message per newly accepted power_report.
+                    taptap_flush_cache(time.time(), report_node=node_name)
                 logger.debug("Successfully processed power event")
                 logger.debug(data)
         else:
@@ -550,7 +562,7 @@ def taptap_tele() -> None:
 
 
 @log_args
-def taptap_flush_cache(now: float) -> None:
+def taptap_flush_cache(now: float, report_node=None) -> None:
     """Update the original MQTT state from the available measurements."""
     global last_tele, state, cache
     dt = {
@@ -779,6 +791,12 @@ def taptap_flush_cache(now: float) -> None:
         result + ":" + "%02d" % (int(time_up / 60)) + ":" + "%02d" % (time_up % 60)
     )
     state["time"] = datetime.fromtimestamp(now, tz.tzlocal()).isoformat()
+    if PUBLISH_EVERY_REPORT:
+        # Mark the report that caused this MQTT update; null on heartbeats.
+        state["report_node"] = report_node
+        state["report_timestamp"] = (
+            state["nodes"][report_node]["timestamp"] if report_node else None
+        )
 
     if client and client.is_connected():
         # Sent LWT update
